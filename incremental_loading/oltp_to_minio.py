@@ -1,55 +1,50 @@
 import pandas as pd
-import boto3
 import json
 import os
 from datetime import datetime, timedelta
 from io import BytesIO
-from sqlalchemy import create_engine
+from dataclasses import dataclass
+from typing import Optional
+
+from etl_utils import db_session, s3_session, BaseTableConfig, get_latest_checkpoint_bronze, save_checkpoint, add_partitions, get_partition_paths, write_parquet_to_s3
+
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+# --- DATACLASS CHO TABLE CONFIG (Extend BaseTableConfig) ---
+@dataclass
+class OLTPTableConfig(BaseTableConfig):
+    """Cấu hình cho mỗi bảng trong pipeline OLTP->Bronze"""
+    pass
+
 class GenericETL:
-    def __init__(self, table_name, pk_col='id', updated_col='updated_at'):
-        self.table_name = table_name
-        self.pk_col = pk_col
-        self.updated_col = updated_col
+    def __init__(self, config: OLTPTableConfig):
+        """
+        Init với OLTPTableConfig dataclass thay vì tham số riêng lẻ
         
-        # Cấu hình kết nối (Dùng chung)
-        self.bucket = os.getenv("ILOADING_BUCKET_NAME")
+        Args:
+            config: OLTPTableConfig instance chứa cấu hình bảng
+        """
+        self.config = config
+        self.table_name = config.table_name
+        self.pk_col = config.pk_col
+        self.updated_col = config.updated_col
+        
+        # Cấu hình kết nối
+        self.bucket = os.getenv("ILOADING_BRONZE_BUCKET_NAME")
         self.window_min = int(os.getenv("WINDOW_MINUTES"))
         self.delta_min = int(os.getenv("DELTA_MINUTES"))
         self.initial_start = os.getenv("INITIAL_START")
-        
-        # Kết nối DB và S3 (Dùng chung)
-        self.engine = create_engine(
-            f"mysql+mysqlconnector://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@"
-            f"{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_DATABASE')}"
-        )
-        self.s3 = boto3.client("s3", 
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-            endpoint_url=os.getenv("AWS_ENDPOINT_URL")
-        )
 
-    # Lấy checkpoint mới nhất từ S3, nếu không có thì dùng giá trị mặc định
-    def get_latest_checkpoint(self):
-        prefix = f"{self.table_name}/metadata/metadata_"
-        try:
-            # Lấy file metadata mới nhất để xác định checkpoint
-            response = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=prefix)
-            # Nếu có file metadata, lấy giá trị last_updated_at từ file mới nhất
-            if 'Contents' in response:
-                # Sắp xếp file theo LastModified để lấy file mới nhất
-                latest_file = sorted(response['Contents'], key=lambda x: x['LastModified'], reverse=True)[0]['Key']
-                obj = self.s3.get_object(Bucket=self.bucket, Key=latest_file)
-                return json.loads(obj['Body'].read().decode('utf-8'))['last_updated_at']
-        except Exception as e:
-            print(f"Checkpoint not found for {self.table_name}, using default.")
-        return self.initial_start
+    def get_latest_checkpoint(self, s3):
+        """Lấy checkpoint mới nhất từ S3, nếu không có thì dùng giá trị mặc định"""
+        checkpoint = get_latest_checkpoint_bronze(s3, self.bucket, self.table_name, self.initial_start)
+        print(f"Loaded checkpoint: {checkpoint}")
+        return checkpoint
 
-    # Lấy tất cả fingerprint (PK + UpdatedAt) trong vùng overlap để loại bỏ những bản ghi trùng lặp
-    def get_fingerprints_in_range(self, start_dt, end_dt):
+    def get_fingerprints_in_range(self, s3, start_dt, end_dt):
+        """Lấy tất cả fingerprint (PK + UpdatedAt) trong vùng overlap để loại bỏ những bản ghi trùng lặp"""
         existing_fps = set()
         date_range = pd.date_range(start=start_dt.date(), end=end_dt.date())
         
@@ -59,7 +54,7 @@ class GenericETL:
         for dt in date_range:
             # Lấy tất cả file trong ngày đó dựa trên partitioning path
             prefix = f"{self.table_name}/year={dt.year}/month={dt.month:02d}/day={dt.day:02d}/"
-            paginator = self.s3.get_paginator('list_objects_v2')
+            paginator = s3.get_paginator('list_objects_v2')
             
             for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
                 if 'Contents' in page:
@@ -86,7 +81,7 @@ class GenericETL:
 
                         # Chỉ đọc file thỏa mãn điều kiện để lấy fingerprint
                         print(f"Reading file for dedup: {file_key}")
-                        resp = self.s3.get_object(Bucket=self.bucket, Key=file_key)
+                        resp = s3.get_object(Bucket=self.bucket, Key=file_key)
                         df_tmp = pd.read_parquet(BytesIO(resp['Body'].read()), columns=[self.pk_col, self.updated_col])
                         
                         # Chuyển cột updated_at sang datetime để so khớp chính xác
@@ -100,10 +95,19 @@ class GenericETL:
                         
         return existing_fps
 
-    # Main ETL Logic
     def run(self):
+        """Main ETL Logic - tạo connections riêng (Standalone mode)"""
+        with db_session() as engine, s3_session() as s3:
+            self._execute_etl(engine, s3)
+
+    def run_etl_with_connections(self, engine, s3):
+        """Main ETL Logic - sử dụng connections đã được cung cấp (Shared mode)"""
+        self._execute_etl(engine, s3)
+
+    def _execute_etl(self, engine, s3):
+        """Phần core ETL logic"""
         start_time = datetime.now()
-        last_checkpoint = datetime.fromisoformat(self.get_latest_checkpoint())
+        last_checkpoint = datetime.fromisoformat(self.get_latest_checkpoint(s3))
         
         # Tính toán Window
         lower_bound = last_checkpoint - timedelta(minutes=self.delta_min)
@@ -114,7 +118,7 @@ class GenericETL:
 
         # Extract dữ liệu mới từ OLTP dựa trên cột updated_at
         query = f"SELECT * FROM {self.table_name} WHERE {self.updated_col} > '{lower_bound}' AND {self.updated_col} <= '{upper_bound}'"
-        df_raw = pd.read_sql(query, self.engine)
+        df_raw = pd.read_sql(query, engine)
         
         oltp_count = len(df_raw)
         dup_count = 0
@@ -125,7 +129,7 @@ class GenericETL:
             df_raw[self.updated_col] = pd.to_datetime(df_raw[self.updated_col])
             
             # Lấy tất cả fingerprint (PK + UpdatedAt) trong vùng overlap để loại bỏ những bản ghi trùng lặp
-            existing_fps = self.get_fingerprints_in_range(lower_bound, upper_bound)
+            existing_fps = self.get_fingerprints_in_range(s3, lower_bound, upper_bound)
             df_raw['fp'] = list(zip(df_raw[self.pk_col], df_raw[self.updated_col]))
             df_diff = df_raw[~df_raw['fp'].isin(existing_fps)].copy()
             df_diff.drop(columns=['fp'], inplace=True)
@@ -135,15 +139,10 @@ class GenericETL:
             # Nếu có dữ liệu mới sau khi loại bỏ trùng lặp, tiến hành partitioning và load lên S3
             if not df_diff.empty:
                 # Partitioning theo ngày dựa trên cột updated_at
-                df_diff['y'] = df_diff[self.updated_col].dt.year
-                df_diff['m'] = df_diff[self.updated_col].dt.month
-                df_diff['d'] = df_diff[self.updated_col].dt.day
+                df_diff = add_partitions(df_diff, self.updated_col)
                 
-                for (y, m, d), group in df_diff.groupby(['y', 'm', 'd']):
-                    path = f"{self.table_name}/year={y}/month={m:02d}/day={d:02d}/data_{upper_bound.strftime('%H%M%S')}.parquet"
-                    buf = BytesIO()
-                    group.drop(columns=['y', 'm', 'd']).to_parquet(buf, index=False, engine='pyarrow')
-                    self.s3.put_object(Bucket=self.bucket, Key=path, Body=buf.getvalue())
+                for p_path, group in get_partition_paths(df_diff, self.table_name, suffix=f"/data_{upper_bound.strftime('%H%M%S')}.parquet"):
+                    write_parquet_to_s3(s3, self.bucket, p_path, group)
                 
                 # Cập nhật checkpoint mới nhất dựa trên cột updated_at lớn nhất trong batch hiện tại
                 final_checkpoint = df_raw[self.updated_col].max().isoformat()
@@ -169,38 +168,58 @@ class GenericETL:
             "delta_upserted": (oltp_count - dup_count),
             "status": status
         }
-        self.save_audit(final_checkpoint, integrity_metrics)
+        self.save_audit(s3, final_checkpoint, integrity_metrics)
 
-    # Lưu metadata audit lên S3 để theo dõi và làm checkpoint cho lần chạy tiếp theo
-    def save_audit(self, checkpoint, integrity_metrics):
-        audit_path = f"{self.table_name}/metadata/metadata_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        
+    def save_audit(self, s3, checkpoint, integrity_metrics):
+        """Lưu metadata audit lên S3 để theo dõi và làm checkpoint cho lần chạy tiếp theo"""
         metadata_data = {
-            "last_updated_at": checkpoint,  # Giá trị cột updated_at lớn nhất từ DB
+            "last_updated_at": checkpoint,
             "etl_performance": {
-                "start_time": integrity_metrics.get("start_time"), # Thời điểm bắt đầu của window
-                "end_time": integrity_metrics.get("end_time"), # Thời điểm kết thúc của window
+                "start_time": integrity_metrics.get("start_time"),
+                "end_time": integrity_metrics.get("end_time"),
             },
             "integrity_check": {
-                "oltp_total_rows": integrity_metrics.get("oltp_total_rows", 0),  # Tổng dòng lấy từ DB
-                "duplicate_rows_removed": integrity_metrics.get("duplicate_rows_removed", 0), # Số dòng trùng bị loại
-                "delta_upserted_total": integrity_metrics.get("delta_upserted", 0), # Tổng dòng thực tế đưa vào Delta
+                "oltp_total_rows": integrity_metrics.get("oltp_total_rows", 0),
+                "duplicate_rows_removed": integrity_metrics.get("duplicate_rows_removed", 0),
+                "delta_upserted_total": integrity_metrics.get("delta_upserted", 0),
             },
             "status": integrity_metrics.get("status", "SUCCESS")
         }
-
-        self.s3.put_object(Bucket=self.bucket, Key=audit_path, Body=json.dumps(metadata_data, indent=4))
+        
+        save_checkpoint(s3, self.bucket, self.table_name, metadata_data, layer='bronze')
         print(f"🏁 {integrity_metrics.get('status')} | Written: {integrity_metrics.get('delta_upserted')} | CP: {checkpoint}")
 
-# Chạy ETL cho từng bảng được cấu hình trong danh sách
-if __name__ == "__main__":
-    # Danh sách các bảng cần chạy
-    tables_to_sync = [
-        {"name": "orders", "pk": "order_id", "updated": "updated_at"},
-        {"name": "users", "pk": "user_id", "updated": "updated_at"},
-        {"name": "products", "pk": "sku", "updated": "updated_at"}
-    ]
+# --- CẤU HÌNH DANH SÁCH BẢNG (Sử dụng Dataclass) ---
+TABLES_TO_SYNC = [
+    OLTPTableConfig(table_name="orders", pk_col="order_id", updated_col="updated_at"),
+    OLTPTableConfig(table_name="users", pk_col="user_id", updated_col="updated_at"),
+    OLTPTableConfig(table_name="products", pk_col="product_id", updated_col="updated_at")
+]
+
+def run_pipeline(configs: list):
+    """
+    Chạy ETL cho nhiều bảng, REUSE connections để tối ưu hiệu suất.
     
-    for config in tables_to_sync:
-        etl = GenericETL(config['name'], config['pk'], config['updated'])
-        etl.run()
+    Args:
+        configs: Danh sách OLTPTableConfig
+    """
+    with db_session() as engine, s3_session() as s3:
+        for config in configs:
+            try:
+                etl = GenericETL(config)
+                print(f"\n{'='*60}")
+                print(f"Processing: {config.table_name}")
+                print(f"{'='*60}")
+                
+                # Gọi run_etl() thay vì run() để pass connections
+                etl.run_etl_with_connections(engine, s3)
+                
+                print(f"Completed: {config.table_name}\n")
+            except Exception as e:
+                print(f"Failed: {config.table_name} - {e}\n")
+                continue
+
+
+if __name__ == "__main__":
+    """Chạy ETL cho tất cả bảng với shared connections"""
+    run_pipeline(TABLES_TO_SYNC)
