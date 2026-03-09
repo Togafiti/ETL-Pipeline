@@ -11,7 +11,4 @@ def clean_orders(df: pd.DataFrame) -> pd.DataFrame:
     if "status" in df.columns:
         df["status"] = df["status"].str.lower().str.strip()
 
-    if "user_id" in df.columns:
-        df["user_id"] = df["user_id"].astype("Int64")
-
     return df

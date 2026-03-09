@@ -30,9 +30,6 @@ def random_date_2026():
     return start_date + timedelta(seconds=random_seconds)
 
 # Load initial promos (assuming table exists)
-cur.execute("SELECT promo_id, discount_percent FROM promotions")
-promos = cur.fetchall()
-
 def insert_categories(max_categories=1000):
     data = [
         (
@@ -118,7 +115,6 @@ def insert_order(products_list):
         ["pending", "cancelled", "shipping", "completed"],
         [10, 5, 25, 60]
     )[0]
-    promo = random.choice(promos) if promos and random.random() < 0.25 else None
 
     # 2. Chọn ngẫu nhiên sản phẩm (Order Items)
     # Hàm pick_products trả về list các tuple: (product_id, qty, price)
@@ -129,14 +125,12 @@ def insert_order(products_list):
 
     # 3. Tính tổng tiền sau giảm giá
     final_total = subtotal
-    if promo:
-        final_total *= (1 - promo["discount_percent"] / 100)
 
     # 4. Chèn vào bảng ORDERS
     cur.execute("""
-        INSERT INTO orders (user_id, promo_id, status, total_amount, created_at)
-        VALUES (%s, %s, %s, %s, %s)
-    """, (user_id, promo["promo_id"] if promo else None, status, round(final_total, 2), order_date))
+        INSERT INTO orders (user_id, status, total_amount, created_at)
+        VALUES (%s, %s, %s, %s)
+    """, (user_id, status, round(final_total, 2), order_date))
     
     order_id = cur.lastrowid
 

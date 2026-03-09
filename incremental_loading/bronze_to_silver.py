@@ -1,5 +1,6 @@
 import pandas as pd
 import os
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from dataclasses import dataclass
 from typing import Optional, Callable
@@ -26,10 +27,7 @@ class TableConfig:
 class SilverIncrementalETL:
     def __init__(self, config: TableConfig):
         """
-        Init với TableConfig dataclass thay vì dict
-        
-        Args:
-            config: TableConfig instance chứa cấu hình bảng
+        Init với TableConfig dataclass để đảm bảo cấu hình rõ ràng và type-safe
         """
         self.config = config
         self.table_name = config.table_name
@@ -37,9 +35,9 @@ class SilverIncrementalETL:
         self.updated_col = config.updated_col
         self.custom_cleaner = config.cleaner_func
         
-        self.bucket_bronze = os.getenv("ILOADING_BRONZE_BUCKET_NAME")
-        self.bucket_silver = os.getenv("ILOADING_SILVER_BUCKET_NAME")
-        self.initial_start = os.getenv("INITIAL_START")
+        self.bucket_bronze = os.getenv("ILOADING_BRONZE_BUCKET_NAME", "bronze-3")
+        self.bucket_silver = os.getenv("ILOADING_SILVER_BUCKET_NAME", "silver-3")
+        self.initial_start = os.getenv("INITIAL_START", "2026-03-02T00:00:00") 
 
     def get_checkpoint(self, s3):
         """Lấy checkpoint từ S3"""
@@ -59,6 +57,14 @@ class SilverIncrementalETL:
         """Main ETL logic - dùng S3 connection có sẵn (shared mode)"""
         self._execute_etl(s3)
 
+    @staticmethod
+    def _parse_checkpoint_to_timestamp(checkpoint: str) -> float:
+        """Parse ISO checkpoint string thành timestamp để so sánh ổn định."""
+        cp_dt = datetime.fromisoformat(checkpoint.replace("Z", "+00:00"))
+        if cp_dt.tzinfo is None:
+            cp_dt = cp_dt.replace(tzinfo=timezone.utc)
+        return cp_dt.timestamp()
+
     def _execute_etl(self, s3):
         """Phần core ETL logic"""
         from datetime import datetime as dt
@@ -67,13 +73,19 @@ class SilverIncrementalETL:
         start_time = dt.now()
         print(f"🚀 Processing Silver: {self.table_name} (From: {last_cp})")
 
+        try:
+            last_cp_ts = self._parse_checkpoint_to_timestamp(last_cp)
+        except ValueError:
+            print(f"⚠️ Invalid checkpoint format '{last_cp}'. Fallback to INITIAL_START.")
+            last_cp_ts = self._parse_checkpoint_to_timestamp(self.initial_start)
+
         # 1. Tìm file Bronze mới
         paginator = s3.get_paginator('list_objects_v2')
         new_files = []
         for page in paginator.paginate(Bucket=self.bucket_bronze, Prefix=f"{self.table_name}/"):
             if 'Contents' in page:
                 for obj in page['Contents']:
-                    if obj['Key'].endswith('.parquet') and obj['LastModified'].isoformat() > last_cp:
+                    if obj['Key'].endswith('.parquet') and obj['LastModified'].timestamp() > last_cp_ts:
                         new_files.append(obj)
 
         if not new_files:
@@ -160,6 +172,26 @@ TABLES_CONFIG = [
         pk_col="user_id",
         updated_col="updated_at",
         cleaner_func=get_cleaner("users")
+    ),
+    TableConfig(
+        table_name="categories",
+        pk_col="category_id",
+        updated_col="updated_at"
+    ),
+    TableConfig(
+        table_name="products",
+        pk_col="product_id",
+        updated_col="updated_at"
+    ),
+    TableConfig(
+        table_name="product_reviews",
+        pk_col="review_id",
+        updated_col="updated_at"
+    ),
+    TableConfig(
+        table_name="order_items",
+        pk_col="item_id",
+        updated_col="updated_at"
     )
 ]
 
@@ -169,9 +201,7 @@ def run_pipeline(configs: list):
         for config in configs:
             try:
                 etl = SilverIncrementalETL(config)
-                print(f"\n{'=' * 60}")
                 print(f"Processing: {config.table_name}")
-                print(f"{'=' * 60}")
 
                 etl.process_etl_with_connection(s3)
 

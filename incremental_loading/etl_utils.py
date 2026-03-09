@@ -8,7 +8,6 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Callable
 from sqlalchemy import create_engine
 
 from dotenv import load_dotenv
@@ -45,6 +44,29 @@ def s3_session():
         yield s3_client
     finally:
         print("S3 connection closed")
+
+
+@contextmanager
+def clickhouse_session():
+    """Context manager tự động setup/cleanup ClickHouse connection (HTTP interface)"""
+    try:
+        import clickhouse_connect
+    except ImportError:
+        raise ImportError("clickhouse-connect not installed. Run: pip install clickhouse-connect")
+    
+    client = clickhouse_connect.get_client(
+        host=os.getenv("CLICKHOUSE_HOST", "localhost"),
+        port=int(os.getenv("CLICKHOUSE_PORT", "8123")),
+        username=os.getenv("CLICKHOUSE_USER", "default"),
+        password=os.getenv("CLICKHOUSE_PASSWORD", ""),
+        database=os.getenv("CLICKHOUSE_DATABASE", "analytics"),
+    )
+    try:
+        print(f"ClickHouse connection established to {os.getenv('CLICKHOUSE_HOST', 'localhost')}")
+        yield client
+    finally:
+        print("ClickHouse connection closed")
+        client.close()
 
 
 # ========== BASE DATACLASS ==========
@@ -103,9 +125,32 @@ def get_latest_checkpoint_silver(s3, bucket: str, table_name: str, initial_start
     return initial_start
 
 
+def get_latest_checkpoint_clickhouse(s3, bucket: str, table_name: str, initial_start: str) -> str:
+    """
+    Lấy checkpoint mới nhất từ S3 metadata cho ClickHouse layer.
+    Đọc từ file: {table_name}/metadata/clickhouse_checkpoint.json
+    Trả về ISO format timestamp của file Silver đã được sync.
+    """
+    path = f"{table_name}/metadata/clickhouse_checkpoint.json"
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=path)
+        data = json.loads(obj['Body'].read().decode('utf-8'))
+        return data.get('last_synced_file_time', initial_start)
+    except Exception as e:
+        print(f"⚠️  ClickHouse checkpoint not found for {table_name}: {e}. Using default.")
+    return initial_start
+
+
 def save_checkpoint(s3, bucket: str, table_name: str, metadata_data: dict, layer: str = 'bronze'):
     """
-    Lưu checkpoint lên S3 cho Bronze hoặc Silver layer.
+    Lưu checkpoint lên S3 cho Bronze, Silver hoặc ClickHouse layer.
+    
+    Args:
+        s3: S3 client
+        bucket: Bucket name
+        table_name: Table name
+        metadata_data: Dictionary chứa metadata của checkpoint
+        layer: 'bronze' | 'silver' | 'clickhouse'
     
     Bronze metadata format (audit trail):
         - Tạo file mới mỗi lần: metadata_YYYYMMDD_HHMMSS.json
@@ -115,13 +160,20 @@ def save_checkpoint(s3, bucket: str, table_name: str, metadata_data: dict, layer
         - Overwrite file cố định: silver_checkpoint.json
         - Chứa: last_processed_file_time, total_records_processed, total_files_processed,
                 processed_at, total_partitions_written, data_quality_metrics
+    
+    ClickHouse metadata format (sync tracking):
+        - Overwrite file cố định: clickhouse_checkpoint.json
+        - Chứa: last_synced_file_time, total_records_inserted, total_files_synced,
+                synced_at, clickhouse_metrics
     """
     if layer == 'bronze':
         path = f"{table_name}/metadata/metadata_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     elif layer == 'silver':
         path = f"{table_name}/metadata/silver_checkpoint.json"
+    elif layer == 'clickhouse':
+        path = f"{table_name}/metadata/clickhouse_checkpoint.json"
     else:
-        raise ValueError(f"Invalid layer: {layer}. Must be 'bronze' or 'silver'.")
+        raise ValueError(f"Invalid layer: {layer}. Must be 'bronze', 'silver' or 'clickhouse'.")
     
     s3.put_object(Bucket=bucket, Key=path, Body=json.dumps(metadata_data, indent=2))
 

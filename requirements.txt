@@ -1,0 +1,17 @@
+# ETL Pipeline Dependencies
+
+# Core Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Database Connectors
+sqlalchemy>=2.0.0
+mysql-connector-python>=8.0.0
+clickhouse-driver>=0.2.6
+
+# Cloud Storage
+boto3>=1.28.0
+
+# Configuration
+python-dotenv>=1.0.0
+

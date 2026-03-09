@@ -32,10 +32,10 @@ class GenericETL:
         self.updated_col = config.updated_col
         
         # Cấu hình kết nối
-        self.bucket = os.getenv("ILOADING_BRONZE_BUCKET_NAME")
-        self.window_min = int(os.getenv("WINDOW_MINUTES"))
-        self.delta_min = int(os.getenv("DELTA_MINUTES"))
-        self.initial_start = os.getenv("INITIAL_START")
+        self.bucket = os.getenv("ILOADING_BRONZE_BUCKET_NAME", "bronze-3")
+        self.window_min = int(os.getenv("WINDOW_MINUTES", 30))
+        self.delta_min = int(os.getenv("DELTA_MINUTES", 10))
+        self.initial_start = os.getenv("INITIAL_START", "2026-03-02T00:00:00")
 
     def get_latest_checkpoint(self, s3):
         """Lấy checkpoint mới nhất từ S3, nếu không có thì dùng giá trị mặc định"""
@@ -191,25 +191,45 @@ class GenericETL:
 
 # --- CẤU HÌNH DANH SÁCH BẢNG (Sử dụng Dataclass) ---
 TABLES_TO_SYNC = [
-    OLTPTableConfig(table_name="orders", pk_col="order_id", updated_col="updated_at"),
-    OLTPTableConfig(table_name="users", pk_col="user_id", updated_col="updated_at"),
-    OLTPTableConfig(table_name="products", pk_col="product_id", updated_col="updated_at")
+    OLTPTableConfig(
+        table_name="orders", 
+        pk_col="order_id", 
+        updated_col="updated_at"
+    ),
+    OLTPTableConfig(
+        table_name="users", 
+        pk_col="user_id", 
+        updated_col="updated_at"
+    ),
+    OLTPTableConfig(
+        table_name="products", 
+        pk_col="product_id", 
+        updated_col="updated_at"
+    ),
+    OLTPTableConfig(
+        table_name="categories", 
+        pk_col="category_id", 
+        updated_col="updated_at"
+    ),
+    OLTPTableConfig(
+        table_name="order_items", 
+        pk_col="item_id", 
+        updated_col="updated_at"
+    ),
+    OLTPTableConfig(
+        table_name="product_reviews", 
+        pk_col="review_id", 
+        updated_col="updated_at"
+    )
 ]
 
 def run_pipeline(configs: list):
-    """
-    Chạy ETL cho nhiều bảng, REUSE connections để tối ưu hiệu suất.
-    
-    Args:
-        configs: Danh sách OLTPTableConfig
-    """
+    """Chạy ETL cho nhiều bảng, REUSE connections để tối ưu hiệu suất"""
     with db_session() as engine, s3_session() as s3:
         for config in configs:
             try:
                 etl = GenericETL(config)
-                print(f"\n{'='*60}")
                 print(f"Processing: {config.table_name}")
-                print(f"{'='*60}")
                 
                 # Gọi run_etl() thay vì run() để pass connections
                 etl.run_etl_with_connections(engine, s3)
