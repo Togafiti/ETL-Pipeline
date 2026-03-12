@@ -162,8 +162,8 @@ def insert_order(products_list):
         """, (order_id, fake.address(), random.choice(["DHL", "FedEx", "UPS"]), ship_date))
 
 # --- Execution ---
-insert_categories(1000)
-seed_products(3000) 
+# insert_categories(1000)
+# seed_products(3000) 
 products_pool = load_products()
 
 TOTAL_ORDERS = 10_000

@@ -10,7 +10,7 @@ __pycache__/
 .mypy_cache/
 
 # Virtual environments
-.venv/
+.venv-1/
 venv/
 env/
 ENV/
@@ -22,3 +22,5 @@ ENV/
 *.swo
 
 ERROR_SCENARIOS.md
+
+data.py
