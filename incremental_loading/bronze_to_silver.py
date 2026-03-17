@@ -22,50 +22,41 @@ from cleaners import generic_clean, apply_schema_padding, get_cleaner
 load_dotenv()
 
 MIN_REQUIRED_SCHEMA = {
-    "orders": {
-        "order_id": "UInt64",
-        "user_id": "UInt64",
+    "operators": {
+        "id": "UInt32",
+        "name": "string",
+        "code": "string",
+        "is_deleted": "UInt8",
+        "created_at": "datetime64[ns]",
+        "updated_at": "datetime64[ns]",
+        "deleted_at": "datetime64[ns]",
+    },
+    "stations": {
+        "id": "UInt32",
+        "station_code": "string",
+        "operator_id": "UInt32",
+        "province": "string",
+        "district": "string",
+        "latitude": "float64",
+        "longitude": "float64",
+        "install_date": "datetime64[ns]",
         "status": "string",
-        "total_amount": "float64",
+        "is_deleted": "UInt8",
         "created_at": "datetime64[ns]",
         "updated_at": "datetime64[ns]",
+        "deleted_at": "datetime64[ns]",
     },
-    "product_reviews": {
-        "review_id": "UInt64",
-        "product_id": "UInt64",
-        "user_id": "UInt64",
-        "rating": "UInt64",
-        "comment": "string",
+    "station_traffic": {
+        "id": "UInt64",
+        "station_id": "UInt32",
+        "technology": "string",
+        "traffic_gb": "float64",
+        "user_count": "UInt32",
+        "event_time": "datetime64[ns]",
+        "is_deleted": "UInt8",
         "created_at": "datetime64[ns]",
         "updated_at": "datetime64[ns]",
-    },
-    "categories": {
-        "category_id": "UInt64",
-        "category_name": "string",
-        "description": "string",
-        "created_at": "datetime64[ns]",
-        "updated_at": "datetime64[ns]",
-    },
-    "products": {
-        "product_id": "UInt64",
-        "category_id": "UInt64",
-        "product_name": "string",
-        "base_price": "float64",
-        "stock_quantity": "UInt64",
-        "created_at": "datetime64[ns]",
-        "updated_at": "datetime64[ns]",
-    },
-    "order_items": {
-        "item_id": "UInt32",
-        "order_id": "UInt32",
-        "product_id": "UInt32",
-        "quantity": "Int32",
-        "unit_price": "float64",
-        "updated_at": "datetime64[ns]",
-    },
-    "users": {
-        "user_id": "UInt64",
-        "updated_at": "datetime64[ns]",
+        "deleted_at": "datetime64[ns]",
     },
 }
 
@@ -104,13 +95,6 @@ class SilverIncrementalETL:
     def __init__(self, config: TableConfig):
         """Khởi tạo Silver ETL processor với cấu hình bảng.
         
-        Args:
-            config: TableConfig instance chứa:
-                - table_name: Tên bảng để xử lý
-                - pk_col: Primary key column cho deduplication
-                - updated_col: Timestamp column cho version tracking
-                - cleaner_func: Optional custom cleaning function
-        
         Note:
             required_schema được lấy từ MIN_REQUIRED_SCHEMA constant.
             Nếu table không có trong MIN_REQUIRED_SCHEMA, sẽ dùng schema mặc định với pk_col + updated_col.
@@ -123,7 +107,7 @@ class SilverIncrementalETL:
         
         self.bucket_bronze = os.getenv("ILOADING_BRONZE_BUCKET_NAME", "bronze-3")
         self.bucket_silver = os.getenv("ILOADING_SILVER_BUCKET_NAME", "silver-3")
-        self.initial_start = os.getenv("INITIAL_START", "2026-03-02T00:00:00") 
+        self.initial_start = os.getenv("INITIAL_START", "2026-03-16T00:00:00") 
         self.required_schema = MIN_REQUIRED_SCHEMA.get(
             self.table_name,
             {
@@ -134,9 +118,6 @@ class SilverIncrementalETL:
 
     def get_checkpoint(self, s3):
         """Lấy checkpoint mới nhất từ S3 để xác định file Bronze nào cần xử lý.
-        
-        Args:
-            s3: Boto3 S3 client instance
         
         Returns:
             str: ISO timestamp của last_processed_file_time từ metadata,
@@ -150,10 +131,9 @@ class SilverIncrementalETL:
 
     def save_checkpoint_with_metrics(self, s3, metadata: dict):
         """Lưu checkpoint với data quality metrics lên S3.
-        
-        Args:
-            s3: Boto3 S3 client instance
-            metadata: Dictionary chứa:
+
+        Note:
+            Metadata file là overwrite.
                 - last_processed_file_time: ISO timestamp của file mới nhất đã xử lý
                 - total_files_processed: Số files đã process trong run
                 - total_records_input: Tổng records từ Bronze
@@ -163,41 +143,22 @@ class SilverIncrementalETL:
                 - schema_columns: List columns hiện tại
                 - data_quality_metrics: Null counts, rows dropped, etc.
                 - status: SUCCESS | IN_PROGRESS | UP_TO_DATE
-        
-        Note:
-            Metadata file là overwrite.
             IN_PROGRESS status cho phép resume khi ETL bị interrupt.
         """
         save_checkpoint(s3, self.bucket_silver, self.table_name, metadata, layer='silver')
 
     def process(self):
-        """Execute Silver ETL trong standalone mode với S3 connection tự quản lý.
-        
-        Mode:
-            Standalone - tạo S3 connection riêng cho ETL run này.
-            Dùng khi chạy single table hoặc testing.
-        """
+        """Execute Silver ETL trong standalone mode với S3 connection tự quản lý."""
         with s3_session() as s3:
             self._execute_etl(s3)
 
     def process_etl_with_connection(self, s3):
-        """Execute Silver ETL với S3 connection được share từ caller.
-        
-        Args:
-            s3: Boto3 S3 client đã được tạo sẵn
-        
-        Mode:
-            Shared - dùng connection được truyền vào từ multi-table pipeline.
-            Hiệu quả hơn khi chạy nhiều tables vì tái sử dụng connection.
-        """
+        """Execute Silver ETL với S3 connection được share từ caller."""
         self._execute_etl(s3)
 
     @staticmethod
     def _parse_checkpoint_to_timestamp(checkpoint: str) -> float:
         """Parse ISO checkpoint string thành Unix timestamp để so sánh với S3 LastModified.
-        
-        Args:
-            checkpoint: ISO format datetime string (có thể có 'Z' suffix)
         
         Returns:
             float: Unix timestamp (seconds since epoch)
@@ -230,9 +191,6 @@ class SilverIncrementalETL:
     def _execute_etl(self, s3):
         """Core Silver ETL logic: Stream Bronze files → Clean → Deduplicate → Merge to Silver.
         
-        Args:
-            s3: Boto3 S3 client để read Bronze và write Silver
-        
         Process Flow:
             1. Load checkpoint và schema từ run trước
             2. Scan Bronze bucket để tìm files có LastModified > checkpoint
@@ -240,24 +198,24 @@ class SilverIncrementalETL:
                 - Save heartbeat metadata với status UP_TO_DATE
                 - Return early
             4. STREAMING PROCESSING (không concat tất cả files):
-                For each Bronze file:
-                    a. Read parquet file
-                    b. Collect null counts BEFORE cleaning
+                Với mỗi Bronze file:
+                    a. Read file vào DataFrame
+                    b. Tính null counts trước khi clean để làm data quality metrics
                     c. Apply generic_clean (drop null PK, parse timestamps)
                     d. Apply custom cleaner nếu có
                     e. Apply schema_padding để đảm bảo MIN_REQUIRED_SCHEMA
                     f. Partition theo year/month/day
-                    g. For each partition:
-                        - Read existing Silver partition (nếu có)
+                    g. Với mỗi partition:
+                        - Đọc partition cũ từ Silver (nếu tồn tại) 
                         - Schema alignment (reindex columns)
                         - Concat old + new data
                         - Deduplicate by PK (keep latest by updated_col)
                         - Drop partition columns (y, m, d)
-                        - Write back to Silver
+                        - Lưu lại vào Silver
                     h. Save IN_PROGRESS checkpoint sau mỗi file (resume support)
             5. Schema evolution detection:
-                - Compare current_columns vs previous_columns
-                - Notify terminal nếu có added/removed columns
+                - So sánh columns hiện tại sau run với previous metadata
+                - Nếu có thay đổi, log chi tiết và gửi notification
             6. Update final checkpoint với:
                 - last_processed_file_time = newest file's LastModified
                 - Total metrics aggregated từ tất cả files
@@ -269,12 +227,8 @@ class SilverIncrementalETL:
         
         Resumability:
             - Checkpoint được update sau mỗi file với status IN_PROGRESS
-            - Nếu run bị interrupt, run tiếp theo sẽ skip files đã process
-        
-        Data Quality:
-            - null_counts_before_clean: Null distribution từ Bronze
-            - null_counts_after_clean: Null distribution sau cleaning
-            - rows_dropped_during_clean: Số records bị drop (null PK, invalid data)
+            - Nếu run bị interrupt, run tiếp theo sẽ skip files đã process rồi dựa trên checkpoint
+            - Nếu không có file mới, checkpoint vẫn được update với status UP_TO_DATE để tránh bị stuck ở checkpoint cũ
         """
         last_cp = self.get_checkpoint(s3)
         start_time = dt.now()
@@ -475,36 +429,22 @@ class SilverIncrementalETL:
 # --- CẤU HÌNH DANH SÁCH BẢNG (Sử dụng Dataclass) ---
 TABLES_CONFIG = [
     TableConfig(
-        table_name="orders",
-        pk_col="order_id",
+        table_name="operators",
+        pk_col="id",
         updated_col="updated_at",
-        cleaner_func=get_cleaner("orders")
+        cleaner_func=get_cleaner("operators")
     ),
     TableConfig(
-        table_name="users",
-        pk_col="user_id",
+        table_name="stations",
+        pk_col="id",
         updated_col="updated_at",
-        cleaner_func=get_cleaner("users")
+        cleaner_func=get_cleaner("stations")
     ),
     TableConfig(
-        table_name="categories",
-        pk_col="category_id",
-        updated_col="updated_at"
-    ),
-    TableConfig(
-        table_name="products",
-        pk_col="product_id",
-        updated_col="updated_at"
-    ),
-    TableConfig(
-        table_name="product_reviews",
-        pk_col="review_id",
-        updated_col="updated_at"
-    ),
-    TableConfig(
-        table_name="order_items",
-        pk_col="item_id",
-        updated_col="updated_at"
+        table_name="station_traffic",
+        pk_col="id",
+        updated_col="updated_at",
+        cleaner_func=get_cleaner("station_traffic")
     )
 ]
 

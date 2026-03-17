@@ -2,6 +2,9 @@ import pandas as pd
 from typing import Dict, Optional
 
 
+INTEGER_DTYPES = {"Int64", "Int32", "Int16", "Int8", "UInt64", "UInt32", "UInt16", "UInt8"}
+
+
 def _default_value_for_dtype(dtype: str):
     """Trả về giá trị mặc định cho column dựa trên dtype khi schema padding.
     
@@ -23,7 +26,7 @@ def _default_value_for_dtype(dtype: str):
     if dtype.startswith("datetime64"):
         return pd.NaT
 
-    if dtype in {"Int64", "Int32", "UInt64", "UInt32"}:
+    if dtype in INTEGER_DTYPES:
         return pd.NA
 
     if dtype in {"float64", "Float64"}:
@@ -84,7 +87,7 @@ def apply_schema_padding(df: pd.DataFrame, required_schema: Dict[str, str]) -> p
 
         if dtype.startswith("datetime64"):
             df[col] = pd.to_datetime(df[col], errors="coerce")
-        elif dtype in {"Int64", "Int32", "UInt64", "UInt32"}:
+        elif dtype in INTEGER_DTYPES:
             numeric_series = pd.to_numeric(df[col], errors="coerce")
             if dtype.startswith("U"):
                 numeric_series = numeric_series.where(numeric_series >= 0)

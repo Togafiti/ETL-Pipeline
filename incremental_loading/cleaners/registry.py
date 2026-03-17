@@ -2,14 +2,16 @@ from typing import Callable, Dict, Optional
 
 import pandas as pd
 
-from .orders import clean_orders
-from .users import clean_users
+from .operators import clean_operators
+from .stations import clean_stations
+from .station_traffic import clean_station_traffic
 
 CleanerFunc = Callable[[pd.DataFrame], pd.DataFrame]
 
 CLEANER_REGISTRY: Dict[str, CleanerFunc] = {
-    "orders": clean_orders,
-    "users": clean_users,
+    "operators": clean_operators,
+    "stations": clean_stations,
+    "station_traffic": clean_station_traffic,
 }
 
 

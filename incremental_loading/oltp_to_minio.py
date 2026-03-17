@@ -41,14 +41,7 @@ class OLTPTableConfig(BaseTableConfig):
 
 class GenericETL:
     def __init__(self, config: OLTPTableConfig):
-        """Khởi tạo Bronze ETL processor với cấu hình bảng.
-        
-        Args:
-            config: OLTPTableConfig instance chứa:
-                - table_name: Tên bảng OLTP nguồn
-                - pk_col: Tên cột primary key (để deduplication)
-                - updated_col: Tên cột timestamp (để incremental loading)
-        """
+        """Khởi tạo Bronze ETL processor với cấu hình bảng."""
         self.config = config
         self.table_name = config.table_name
         self.pk_col = config.pk_col
@@ -58,34 +51,18 @@ class GenericETL:
         self.bucket = os.getenv("ILOADING_BRONZE_BUCKET_NAME", "bronze-3")
         self.window_min = int(os.getenv("WINDOW_MINUTES", 30))
         self.delta_min = int(os.getenv("DELTA_MINUTES", 10))
-        self.initial_start = os.getenv("INITIAL_START", "2026-03-02T00:00:00")
+        self.initial_start = os.getenv("INITIAL_START", "2026-03-16T00:00:00")
         self.tmp_prefix = os.getenv("BRONZE_TMP_PREFIX", "_tmp")
         self.tmp_retention_hours = int(os.getenv("TMP_RETENTION_HOURS", 24))
 
     def get_latest_checkpoint(self, s3):
-        """Lấy checkpoint mới nhất từ S3 metadata để xác định điểm bắt đầu cho run tiếp theo.
-        
-        Args:
-            s3: Boto3 S3 client instance
-        
-        Returns:
-            str: ISO format timestamp của lần extract cuối cùng thành công.
-                 Nếu chưa có checkpoint, trả về INITIAL_START từ env.
-        
-        Note:
-            Checkpoint được lưu trong {table_name}/metadata/metadata_*.json
-            và được sắp xếp theo LastModified để tìm file mới nhất.
-        """
+        """Lấy checkpoint mới nhất từ S3 metadata để xác định điểm bắt đầu cho run tiếp theo."""
         checkpoint = get_latest_checkpoint_bronze(s3, self.bucket, self.table_name, self.initial_start)
         print(f"Loaded checkpoint: {checkpoint}")
         return checkpoint
 
     def get_fingerprints_in_range(self, s3, start_dt, end_dt):
         """Scan tất cả fingerprint (PK + UpdatedAt) trong time range để deduplication.
-        
-        Args:
-            start_dt: Lower bound timestamp (aware datetime) của window cần scan
-            end_dt: Upper bound timestamp (aware datetime) của window cần scan
         
         Returns:
             set: Set of tuples (pk_value, updated_at_timestamp) đại diện cho các record đã tồn tại.
@@ -151,7 +128,7 @@ class GenericETL:
         """Sinh S3 key cho staging file trong two-phase commit pattern.
         
         Args:
-            final_key: S3 key cuối cùng mà file sẽ được publish (e.g., orders/year=2026/month=03/day=09/data_152030.parquet)
+            final_key: S3 key cuối cùng mà file sẽ được publish (e.g., station_traffic/year=2026/month=03/day=09/data_152030.parquet)
             run_id: Unique identifier của ETL run (format: YYYYMMDD_HHMMSS_timestamp)
         
         Returns:
@@ -170,14 +147,11 @@ class GenericETL:
     def _to_parquet_payload(df: pd.DataFrame) -> bytes:
         """Serialize DataFrame thành parquet bytes để hỗ trợ content-based idempotent checking.
         
-        Args:
-            df: DataFrame cần serialize
-        
         Returns:
             bytes: Parquet binary payload, không bao gồm index
         
         Note:
-            Parquet format deterministic với cùng data + schema sẽ tạo ra cùng bytes.
+            Parquet format được chọn vì hỗ trợ schema, efficient compression, và đặc biệt là stable serialization (cùng content sẽ cho cùng hash).
             Điều này cho phép hash content để so sánh file duplicate mà không cần re-download.
         """
         buf = BytesIO()
@@ -187,10 +161,7 @@ class GenericETL:
     @staticmethod
     def _compute_payload_hash(payload: bytes) -> str:
         """Tính SHA256 hash của payload để idempotent detection.
-        
-        Args:
-            payload: Binary content cần hash (thường là parquet bytes)
-        
+      
         Returns:
             str: Hexadecimal digest của SHA256 hash (64 characters)
         
@@ -201,11 +172,7 @@ class GenericETL:
         return hashlib.sha256(payload).hexdigest()
 
     def _head_object_optional(self, s3, key: str) -> Optional[dict]:
-        """Get S3 object metadata mà không raise exception nếu object không tồn tại.
-        
-        Args:
-            s3: Boto3 S3 client instance
-            key: S3 key cần kiểm tra
+        """Thực hiện head_object để kiểm tra sự tồn tại của object mà không raise exception nếu không tồn tại.
         
         Returns:
             dict: Head object response chứa ContentLength, Metadata, etc. nếu object exists
@@ -215,7 +182,7 @@ class GenericETL:
             ClientError: Nếu lỗi khác ngoài 404 (ví dụ: permission denied)
         
         Note:
-            Hàm này dùng để kiểm tra idempotent trước khi commit staging file.
+            Hàm này được dùng để kiểm tra idempotent trước khi commit: nếu final key đã tồn tại, lấy metadata để so sánh hash.
         """
         try:
             return s3.head_object(Bucket=self.bucket, Key=key)
@@ -306,7 +273,7 @@ class GenericETL:
             )
 
     def _commit_staged_object(self, s3, staged_key: str, final_key: str):
-        """Atomically promote staged file thành final published file.
+        """Commit staged object sang final key bằng cách copy trong S3.
         
         Args:
             s3: Boto3 S3 client instance
@@ -333,10 +300,6 @@ class GenericETL:
     def _delete_objects_safe(self, s3, keys: List[str]):
         """Batch delete S3 objects với automatic chunking để tránh API limit.
         
-        Args:
-            s3: Boto3 S3 client instance
-            keys: List các S3 keys cần xóa (filter None/empty trước khi xóa)
-        
         Note:
             - S3 delete_objects API giới hạn 1000 objects/request
             - Hàm này tự động chia thành chunks 1000 để handle large batch
@@ -353,12 +316,7 @@ class GenericETL:
                 Delete={"Objects": [{"Key": k} for k in chunk]},
             )
 
-    def _build_transaction_items(
-        self,
-        df_diff: pd.DataFrame,
-        upper_bound: datetime,
-        run_id: str,
-    ) -> List[Dict[str, object]]:
+    def _build_transaction_items(self, df_diff: pd.DataFrame, upper_bound: datetime, run_id: str) -> List[Dict[str, object]]:
         """Chuẩn bị transaction plan chứa tất cả partitions cần write trong time window.
         
         Args:
@@ -398,7 +356,7 @@ class GenericETL:
         return tx_items
 
     def _write_partitions_transactional(self, s3, tx_items: List[Dict[str, object]]):
-        """Execute two-phase commit với all-or-nothing guarantee cho toàn bộ window.
+        """Thực hiện transactional write cho tất cả partitions trong window với two-phase commit pattern.
         
         Args:
             s3: Boto3 S3 client instance
@@ -467,11 +425,13 @@ class GenericETL:
             for item in tx_items:
                 if item.get("skip_commit"):
                     continue
-
+                
+                # Commit staged file sang final key
                 self._commit_staged_object(s3, item["staged_key"], item["final_key"])
                 committed_new_keys.append(item["final_key"])
                 print(f"Committed file: {item['final_key']}")
 
+        # Nếu có lỗi nào xảy ra trong quá trình commit, rollback toàn bộ transaction bằng cách xóa tất cả final keys đã commit.
         except Exception:
             if committed_new_keys:
                 print(f"⚠️ Rolling back {len(committed_new_keys)} committed file(s) due to transaction failure")
@@ -484,18 +444,10 @@ class GenericETL:
     def _cleanup_stale_tmp_files(self, s3):
         """Periodic cleanup cho staging files cũ quá TMP_RETENTION_HOURS.
         
-        Args:
-            s3: Boto3 S3 client instance
-        
         Logic:
             1. Scan tất cả objects trong {tmp_prefix}/{table_name}/
             2. Xóa objects có LastModified < (now - TMP_RETENTION_HOURS)
             3. Batch delete 1000 objects/lần để tuân thủ S3 API limit
-        
-        Use Case:
-            - Nếu ETL run bị crash giữa chừng, staged files sẽ bị bỏ lại
-            - Cleanup định kỳ ở đầu mỗi run để tránh tích lũy storage cost
-            - Retention window cho phép debug recent failures
         
         Note:
             Cleanup failure không làm fail ETL run, chỉ log warning.
@@ -525,40 +477,16 @@ class GenericETL:
             print(f"Cleaned {deleted_count} stale tmp file(s) under {tmp_root}")
 
     def run(self):
-        """Execute Bronze ETL trong standalone mode với connections tự quản lý.
-        
-        Mode:
-            Standalone - tạo DB và S3 connections riêng cho ETL run này.
-            Dùng khi chạy single table hoặc testing.
-        
-        See Also:
-            run_etl_with_connections() - Shared connection mode cho multi-table pipeline
-        """
+        """Execute Bronze ETL trong standalone mode với connections tự quản lý."""
         with db_session() as engine, s3_session() as s3:
             self._execute_etl(engine, s3)
 
     def run_etl_with_connections(self, engine, s3):
-        """Execute Bronze ETL với connections được share từ caller.
-        
-        Args:
-            engine: SQLAlchemy engine đã được tạo sẵn
-            s3: Boto3 S3 client đã được tạo sẵn
-        
-        Mode:
-            Shared - dùng connections được truyền vào từ multi-table pipeline.
-            Hiệu quả hơn khi chạy nhiều tables vì tái sử dụng connection pool.
-        
-        See Also:
-            run() - Standalone mode với connections riêng
-        """
+        """Execute Bronze ETL với connections được share từ caller."""
         self._execute_etl(engine, s3)
 
     def _execute_etl(self, engine, s3):
         """Core Bronze ETL logic: Extract từ OLTP → Deduplicate → Transactional write → S3.
-        
-        Args:
-            engine: SQLAlchemy engine để query OLTP database
-            s3: Boto3 S3 client để read/write Bronze layer
         
         Process Flow:
             1. Cleanup stale tmp files từ run trước (nếu có)
@@ -585,14 +513,13 @@ class GenericETL:
             - EMPTY_SOURCE: Query OLTP không trả về data
         
         Schema Evolution:
-            - Compare current columns vs previous metadata
-            - Notify terminal nếu có added/removed columns
+            - So sánh schema columns với metadata run trước để detect added/removed columns
+            - Nếu có thay đổi, gửi notification và log chi tiết (cột nào thêm, cột nào bỏ)
             - Update metadata với schema mới
         
         Checkpoint Strategy:
-            - Window-based progressive checkpoint để tránh stuck
             - Overlap window (DELTA) để catch late-arriving updates
-            - Checkpoint luôn được update (không stuck) ngay cả khi no data
+            - Checkpoint luôn được update (không stuck) ngay cả khi không có data mới
         """
         start_time = datetime.now()
 
@@ -619,6 +546,7 @@ class GenericETL:
         query = f"SELECT * FROM {self.table_name} WHERE {self.updated_col} > '{lower_bound}' AND {self.updated_col} <= '{upper_bound}'"
         df_raw = pd.read_sql(query, engine)
 
+        # Detect schema evolution bằng cách so sánh columns hiện tại với metadata run trước. Nếu có thay đổi, gửi notification và log chi tiết.
         current_columns = sorted([str(col) for col in df_raw.columns.tolist()])
         schema_diff = diff_schema_columns(previous_columns, current_columns)
         if previous_columns and schema_diff['changed']:
@@ -649,7 +577,6 @@ class GenericETL:
 
             # Nếu có dữ liệu mới sau khi loại bỏ trùng lặp, tiến hành partitioning và load lên S3
             if not df_diff.empty:
-                # Partitioning theo ngày dựa trên cột updated_at
                 df_diff = add_partitions(df_diff, self.updated_col)
                 run_id = f"{start_time.strftime('%Y%m%d_%H%M%S')}_{int(start_time.timestamp())}"
 
@@ -712,33 +639,18 @@ class GenericETL:
 # --- CẤU HÌNH DANH SÁCH BẢNG (Sử dụng Dataclass) ---
 TABLES_TO_SYNC = [
     OLTPTableConfig(
-        table_name="orders", 
-        pk_col="order_id", 
+        table_name="operators",
+        pk_col="id",
         updated_col="updated_at"
     ),
     OLTPTableConfig(
-        table_name="users", 
-        pk_col="user_id", 
+        table_name="stations",
+        pk_col="id",
         updated_col="updated_at"
     ),
     OLTPTableConfig(
-        table_name="products", 
-        pk_col="product_id", 
-        updated_col="updated_at"
-    ),
-    OLTPTableConfig(
-        table_name="categories", 
-        pk_col="category_id", 
-        updated_col="updated_at"
-    ),
-    OLTPTableConfig(
-        table_name="order_items", 
-        pk_col="item_id", 
-        updated_col="updated_at"
-    ),
-    OLTPTableConfig(
-        table_name="product_reviews", 
-        pk_col="review_id", 
+        table_name="station_traffic",
+        pk_col="id",
         updated_col="updated_at"
     )
 ]

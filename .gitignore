@@ -20,7 +20,3 @@ ENV/
 .idea/
 *.swp
 *.swo
-
-ERROR_SCENARIOS.md
-
-data.py

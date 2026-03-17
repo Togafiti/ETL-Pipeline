@@ -192,7 +192,7 @@ def get_latest_checkpoint_bronze(s3, bucket: str, table_name: str, initial_start
             data = json.loads(obj['Body'].read().decode('utf-8'))
             return data.get('last_updated_at', initial_start)
     except Exception as e:
-        print(f"⚠️  Bronze checkpoint not found for {table_name}: {e}. Using default.")
+        print(f"Bronze checkpoint not found for {table_name}: {e}. Using default.")
     return initial_start
 
 
@@ -449,15 +449,15 @@ def notify_schema_event(title: str, message: str, level: str = "WARN") -> bool:
     
     Output Format:
         [2026-03-09 15:20:30] [WARN] Schema Evolution Alert - Bronze
-          Table: orders
-          Added columns: ['discount', 'tax_amount']
+                    Table: station_traffic
+                    Added columns: ['technology_band']
           Removed columns: []
           Layer: Bronze
     
     Example:
         notify_schema_event(
             title="Schema Evolution Alert - Silver",
-            message="Table: orders\nAdded: ['discount']\nLayer: Silver",
+            message="Table: station_traffic\nAdded: ['technology_band']\nLayer: Silver",
             level="WARN"
         )
     
@@ -530,7 +530,7 @@ def get_partition_paths(df: pd.DataFrame, table_name: str, suffix: str = "/data.
     
     Path Format:
         {table_name}/year={y}/month={mm}/day={dd}{suffix}
-        Ví dụ: orders/year=2026/month=03/day=09/data.parquet
+        Ví dụ: station_traffic/year=2026/month=03/day=09/data.parquet
     
     Process:
         1. Find unique combinations của (y, m, d)

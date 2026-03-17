@@ -20,9 +20,6 @@ load_dotenv()
 def _parse_iso_datetime(value: str) -> datetime:
     """Parse ISO datetime string và normalize timezone để so sánh chính xác.
     
-    Args:
-        value: ISO datetime string (có thể có trailing 'Z' timezone marker)
-    
     Returns:
         datetime: Aware datetime object với timezone UTC
     
@@ -42,13 +39,6 @@ def _parse_iso_datetime(value: str) -> datetime:
 class ClickHouseTableConfig:
     """Cấu hình cho mỗi bảng trong pipeline Silver->ClickHouse.
     
-    Attributes:
-        table_name: Tên bảng Silver (dùng làm S3 prefix)
-        pk_col: Tên cột primary key (để deduplication trong ReplacingMergeTree)
-        version_col: Tên cột version/timestamp cho ReplacingMergeTree (optional)
-        clickhouse_table: Tên table trong ClickHouse (default giống table_name)
-        clickhouse_database: Database name trong ClickHouse (default: analytics)
-    
     Validation:
         __post_init__ sẽ raise ValueError nếu table_name hoặc pk_col để trống.
     """
@@ -58,6 +48,7 @@ class ClickHouseTableConfig:
     version_col: Optional[str] = None
     clickhouse_table: Optional[str] = None
     clickhouse_database: str = "analytics"
+    split_month_column: Optional[str] = None
 
     def __post_init__(self):
         """Validation và set defaults sau khi khởi tạo dataclass.
@@ -68,6 +59,12 @@ class ClickHouseTableConfig:
         Side Effects:
             - Nếu clickhouse_table không được set, sẽ dùng table_name
         """
+        if not self.table_name or not self.pk_col:
+            raise ValueError("table_name và pk_col không được để trống")
+        if not self.clickhouse_table:
+            self.clickhouse_table = self.table_name
+        if self.split_month_column:
+            self.split_month_column = self.split_month_column.replace("`", "")
 
 
 class SilverToClickHouse:
@@ -112,15 +109,17 @@ class SilverToClickHouse:
         self.quarantine_bucket = os.getenv("CLICKHOUSE_QUARANTINE_BUCKET", self.bucket_silver)
         self.quarantine_prefix = os.getenv("CLICKHOUSE_QUARANTINE_PREFIX", "_quarantine/clickhouse")
         self.quarantine_move_source = os.getenv("CLICKHOUSE_QUARANTINE_MOVE_SOURCE", "1") == "1"
+        self.split_insert_by_created_month = os.getenv("CLICKHOUSE_SPLIT_BY_CREATED_MONTH", "1") == "1"
+        self.split_month_column = (
+            config.split_month_column
+            or os.getenv("CLICKHOUSE_SPLIT_MONTH_COLUMN", "created_at")
+        )
 
         if not self.bucket_silver:
             raise ValueError("ILOADING_SILVER_BUCKET_NAME environment variable not set")
 
     def get_checkpoint(self, s3) -> str:
         """Lấy checkpoint ClickHouse layer để xác định files cần sync.
-        
-        Args:
-            s3: Boto3 S3 client instance
         
         Returns:
             str: ISO timestamp của last_synced_file_time,
@@ -139,10 +138,9 @@ class SilverToClickHouse:
 
     def save_checkpoint_with_metrics(self, s3, metadata: dict):
         """Lưu sync metadata với ClickHouse metrics lên S3.
-        
-        Args:
-            s3: Boto3 S3 client instance
-            metadata: Dictionary chứa:
+
+        Note:
+            Metadata file là overwrite (không phải append).
                 - last_synced_file_time: ISO timestamp của file mới nhất đã sync
                 - total_files_found: Số files mới tìm thấy
                 - total_files_succeeded: Số files insert thành công
@@ -152,9 +150,6 @@ class SilverToClickHouse:
                 - failed_file_details: Chi tiết lỗi + quarantine info
                 - auto_added_columns: Columns được thêm tự động
                 - clickhouse_metrics: Total rows in table, database, table name
-        
-        Note:
-            Metadata file là overwrite (không phải append).
         """
         save_checkpoint(
             s3,
@@ -167,15 +162,9 @@ class SilverToClickHouse:
     def _validate_clickhouse_table_exists(self, ch_client):
         """Kiểm tra ClickHouse table tồn tại trước khi sync.
         
-        Args:
-            ch_client: ClickHouse client instance
-        
         Raises:
             ValueError: Nếu table không tồn tại trong database.
                        Message hướng dẫn tạo table từ clickhouse_schemas.sql
-        
-        Note:
-            Table phải được tạo sẵn bằng DDL script, ETL không tự động CREATE TABLE.
         """
         query = f"""
         SELECT count()
@@ -193,9 +182,6 @@ class SilverToClickHouse:
 
     def _get_clickhouse_table_columns(self, ch_client) -> List[str]:
         """Lấy danh sách column names của ClickHouse table (không bao gồm internal columns).
-        
-        Args:
-            ch_client: ClickHouse client instance
         
         Returns:
             List[str]: Ordered list các column names, không bao gồm _sign, _version
@@ -218,9 +204,6 @@ class SilverToClickHouse:
     def _get_clickhouse_table_column_types(self, ch_client) -> Dict[str, str]:
         """Lấy mapping column name → ClickHouse type cho schema comparison.
         
-        Args:
-            ch_client: ClickHouse client instance
-        
         Returns:
             Dict[str, str]: Mapping từ column name sang ClickHouse type string
                            (e.g., {'order_id': 'UInt64', 'total_amount': 'Float64'})
@@ -242,10 +225,6 @@ class SilverToClickHouse:
 
     def _read_parquet_schema(self, s3, file_key: str):
         """Read parquet file schema bằng pyarrow để detect columns và types.
-        
-        Args:
-            s3: Boto3 S3 client instance
-            file_key: S3 key của parquet file
         
         Returns:
             pyarrow.Schema: Schema object chứa fields và types
@@ -323,10 +302,6 @@ class SilverToClickHouse:
     def _get_file_columns(self, s3, file_key: str) -> List[str]:
         """Lấy danh sách column names từ parquet file schema.
         
-        Args:
-            s3: Boto3 S3 client instance
-            file_key: S3 key của parquet file
-        
         Returns:
             List[str]: Ordered list các column names trong file
         """
@@ -376,6 +351,7 @@ class SilverToClickHouse:
                 if field.name not in parquet_types:
                     parquet_types[field.name] = field.type
 
+        # So sánh và ALTER TABLE ADD COLUMN cho các column mới
         added_columns = []
         for col_name, pa_type in parquet_types.items():
             if col_name in existing_types:
@@ -390,6 +366,7 @@ class SilverToClickHouse:
             added_columns.append({"column": col_name, "clickhouse_type": ch_type, "pyarrow_type": str(pa_type)})
             print(f"  + Added column: {col_name} {ch_type} (from {pa_type})")
 
+        # Notify schema evolution event nếu có columns mới được thêm
         if added_columns:
             added = ", ".join([f"{c['column']}:{c['clickhouse_type']}" for c in added_columns])
             notify_schema_event(
@@ -439,6 +416,35 @@ class SilverToClickHouse:
 
         return sorted(new_files, key=lambda x: x["LastModified"])
 
+    def _build_s3_source_expression(self, s3_url: str) -> str:
+        """Build ClickHouse s3() table function expression cho một object URL."""
+        return (
+            f"s3('{s3_url}', "
+            f"'{self.s3_access_key}', "
+            f"'{self.s3_secret_key}', "
+            "'Parquet')"
+        )
+
+    def _get_table_row_count(self, ch_client) -> int:
+        """Lấy tổng số dòng hiện tại trong ClickHouse table mục tiêu."""
+        return ch_client.query(
+            f"SELECT count() FROM {self.clickhouse_database}.{self.clickhouse_table}"
+        ).result_rows[0][0]
+
+    def _get_distinct_month_values_from_file(self, ch_client, s3_url: str, month_column: str) -> List[int]:
+        """Lấy danh sách YYYYMM distinct từ file parquet thông qua ClickHouse s3() source."""
+        source_expr = self._build_s3_source_expression(s3_url)
+        safe_col = month_column.replace("`", "")
+
+        query = f"""
+        SELECT DISTINCT toYYYYMM(`{safe_col}`) AS ym
+        FROM {source_expr}
+        WHERE `{safe_col}` IS NOT NULL
+        ORDER BY ym
+        """
+        result = ch_client.query(query)
+        return [int(row[0]) for row in result.result_rows if row and row[0] is not None]
+
     def _insert_from_s3(self, s3, ch_client, file_keys: List[str], table_columns: List[str]):
         """Insert data từ danh sách S3 files vào ClickHouse bằng s3() table function.
         
@@ -456,10 +462,9 @@ class SilverToClickHouse:
         Process (Per-File):
             1. Read parquet schema để lấy file columns
             2. Intersection: selected_columns = table_columns ∩ file_columns
-            3. Build INSERT query với s3() table function:
-                INSERT INTO {table} ({selected_columns})
-                SELECT {selected_columns}
-                FROM s3('{s3_url}', '{access_key}', '{secret_key}', 'Parquet')
+            3. Nếu có cột split-month phù hợp và feature bật:
+                - Tách insert theo từng bucket toYYYYMM(split_month_column)
+                - Mỗi bucket chạy một INSERT riêng để giảm số partitions/block
             4. Count rows before và after insert để tính rows_added
             5. Nếu exception:
                 - Quarantine file (copy + error manifest + optional delete source)
@@ -479,7 +484,6 @@ class SilverToClickHouse:
         Note:
             - Per-file insertion cho phép partial success và detailed tracking
             - ClickHouse s3() function read trực tiếp từ S3, không cần download local
-            - Endpoint phải là URL mà ClickHouse access được (thường dùng host.docker.internal)
         """
         if not file_keys:
             return 0, []
@@ -489,6 +493,9 @@ class SilverToClickHouse:
         
         # Insert từng file một để dễ dàng tracking lỗi và tính toán số rows inserted chính xác
         for file_key in file_keys:
+            split_buckets_inserted = 0
+            split_bucket_total = 0
+
             try:
                 file_columns = self._get_file_columns(s3, file_key)
                 selected_columns = [col for col in table_columns if col in file_columns]
@@ -498,59 +505,98 @@ class SilverToClickHouse:
 
                 columns_select = ", ".join(selected_columns)
                 columns_insert = ", ".join(selected_columns)
+                month_col = self.split_month_column.replace("`", "")
 
                 # S3 URL cho ClickHouse (đảm bảo endpoint và bucket đúng)
                 s3_url = f"{self.minio_url}/{self.bucket_silver}/{file_key}"
-                
-                # INSERT query using s3() table function
-                query = f"""
-                INSERT INTO {self.clickhouse_database}.{self.clickhouse_table} ({columns_insert})
-                SELECT {columns_select}
-                FROM s3(
-                    '{s3_url}',
-                    '{self.s3_access_key}',
-                    '{self.s3_secret_key}',
-                    'Parquet'
-                )
-                """
-                
+                source_expr = self._build_s3_source_expression(s3_url)
+
                 # Lấy count trước khi insert
-                rows_before = ch_client.query(
-                    f"SELECT count() FROM {self.clickhouse_database}.{self.clickhouse_table}"
-                ).result_rows[0][0]
-                
-                # Execute INSERT
-                ch_client.command(query)
-                
-                # Lấy count sau khi insert 
-                rows_after = ch_client.query(
-                    f"SELECT count() FROM {self.clickhouse_database}.{self.clickhouse_table}"
-                ).result_rows[0][0]
-                
+                rows_before = self._get_table_row_count(ch_client)
+
+                can_split_by_month = (
+                    self.split_insert_by_created_month
+                    and month_col in file_columns
+                )
+
+                if can_split_by_month:
+                    month_values = self._get_distinct_month_values_from_file(ch_client, s3_url, month_col)
+                    split_bucket_total = len(month_values)
+
+                    if month_values:
+                        for ym in month_values:
+                            split_query = f"""
+                            INSERT INTO {self.clickhouse_database}.{self.clickhouse_table} ({columns_insert})
+                            SELECT {columns_select}
+                            FROM {source_expr}
+                            WHERE toYYYYMM(`{month_col}`) = {int(ym)}
+                            """
+                            ch_client.command(split_query)
+                            split_buckets_inserted += 1
+                    else:
+                        # Fallback nếu cột tồn tại nhưng toàn bộ giá trị null
+                        query = f"""
+                        INSERT INTO {self.clickhouse_database}.{self.clickhouse_table} ({columns_insert})
+                        SELECT {columns_select}
+                        FROM {source_expr}
+                        """
+                        ch_client.command(query)
+                else:
+                    query = f"""
+                    INSERT INTO {self.clickhouse_database}.{self.clickhouse_table} ({columns_insert})
+                    SELECT {columns_select}
+                    FROM {source_expr}
+                    """
+                    ch_client.command(query)
+
+                # Lấy count sau khi insert
+                rows_after = self._get_table_row_count(ch_client)
+
                 rows_added = rows_after - rows_before
                 total_rows_inserted += rows_added
-                
-                print(f"    ✓ {file_key}: +{rows_added} rows ({len(selected_columns)} cols)")
-                
+
+                split_note = ""
+                if split_bucket_total > 0:
+                    split_note = (
+                        f", split {split_buckets_inserted}/{split_bucket_total} "
+                        f"month buckets by {month_col}"
+                    )
+
+                print(f"    ✓ {file_key}: +{rows_added} rows ({len(selected_columns)} cols{split_note})")
+
             except Exception as exc:
-                print(f"    ✗ {file_key}: FAILED - {exc}")
-                quarantine_result = self._quarantine_failed_file(s3, file_key, str(exc))
+                partial_insert_detected = split_buckets_inserted > 0
+
+                if partial_insert_detected:
+                    print(
+                        f"    ✗ {file_key}: FAILED after {split_buckets_inserted}/{split_bucket_total} "
+                        f"month buckets inserted - {exc}"
+                    )
+                else:
+                    print(f"    ✗ {file_key}: FAILED - {exc}")
+
+                quarantine_result = self._quarantine_failed_file(
+                    s3,
+                    file_key,
+                    str(exc),
+                    move_source_override=False if partial_insert_detected else None,
+                )
                 failed_files.append(
                     {
                         "file": file_key,
                         "error": str(exc),
                         "quarantine": quarantine_result,
+                        "partial_insert_detected": partial_insert_detected,
+                        "split_buckets_inserted": split_buckets_inserted,
+                        "split_bucket_total": split_bucket_total,
                     }
                 )
                 continue
-        
+
         return total_rows_inserted, failed_files
 
     def _build_quarantine_key(self, file_key: str) -> str:
         """Sinh quarantine S3 key cho failed file với timestamp isolation.
-        
-        Args:
-            file_key: Original S3 key của failed file
         
         Returns:
             str: Quarantine key format:
@@ -564,13 +610,14 @@ class SilverToClickHouse:
         normalized_file = file_key.lstrip("/")
         return f"{normalized_prefix}/{self.table_name}/{ts}/{normalized_file}"
 
-    def _quarantine_failed_file(self, s3, file_key: str, error_message: str) -> dict:
+    def _quarantine_failed_file(self, s3, file_key: str, error_message: str, move_source_override: Optional[bool] = None) -> dict:
         """Isolate failed file vào quarantine area với error manifest để điều tra.
         
         Args:
             s3: Boto3 S3 client instance
             file_key: S3 key của failed file
             error_message: Exception message hoặc error description
+            move_source_override: Optional override cho hành vi xóa source file sau khi quarantine.
         
         Returns:
             dict: Quarantine detail chứa:
@@ -591,7 +638,7 @@ class SilverToClickHouse:
             3. Write error manifest JSON (filename + .error.json):
                 {
                   "source_bucket": "silver-3",
-                  "source_key": "orders/...",
+                                    "source_key": "station_traffic/...",
                   "error": "Column type mismatch...",
                   "failed_at": "2026-03-09T15:20:30Z",
                   ...
@@ -610,6 +657,7 @@ class SilverToClickHouse:
         """
         quarantine_key = self._build_quarantine_key(file_key)
         manifest_key = f"{quarantine_key}.error.json"
+        move_source = self.quarantine_move_source if move_source_override is None else move_source_override
 
         detail = {
             "source_bucket": self.bucket_silver,
@@ -620,6 +668,7 @@ class SilverToClickHouse:
             "quarantine_bucket": self.quarantine_bucket,
             "quarantine_key": quarantine_key,
             "source_deleted": False,
+            "source_move_enabled": move_source,
         }
 
         try:
@@ -629,7 +678,7 @@ class SilverToClickHouse:
                 Key=quarantine_key,
             )
 
-            if self.quarantine_move_source:
+            if move_source:
                 try:
                     s3.delete_object(Bucket=self.bucket_silver, Key=file_key)
                     detail["source_deleted"] = True
@@ -662,34 +711,16 @@ class SilverToClickHouse:
         return detail
 
     def sync(self):
-        """Execute ClickHouse sync trong standalone mode với connections tự quản lý.
-        
-        Mode:
-            Standalone - tạo S3 và ClickHouse connections riêng cho sync run này.
-            Dùng khi chạy single table hoặc testing.
-        """
+        """Execute ClickHouse sync trong standalone mode với connections tự quản lý."""
         with s3_session() as s3, clickhouse_session() as ch:
             self._execute_sync(s3, ch)
 
     def sync_with_connections(self, s3, ch):
-        """Execute ClickHouse sync với connections được share từ caller.
-        
-        Args:
-            s3: Boto3 S3 client đã được tạo sẵn
-            ch: ClickHouse client đã được tạo sẵn
-        
-        Mode:
-            Shared - dùng connections được truyền vào từ multi-table pipeline.
-            Hiệu quả hơn khi sync nhiều tables vì tái sử dụng connection pool.
-        """
+        """Execute ClickHouse sync với connections được share từ caller."""
         self._execute_sync(s3, ch)
 
     def _execute_sync(self, s3, ch_client):
         """Core ClickHouse sync logic: Silver S3 → ClickHouse table với quarantine support.
-        
-        Args:
-            s3: Boto3 S3 client để read Silver files
-            ch_client: ClickHouse client để insert data
         
         Process Flow:
             1. Load checkpoint từ metadata
@@ -810,34 +841,25 @@ class SilverToClickHouse:
 # --- CẤU HÌNH DANH SÁCH BẢNG (Sử dụng Dataclass) ---
 TABLES_CONFIG = [
     ClickHouseTableConfig(
-        table_name="orders",
-        pk_col="order_id",
+        table_name="operators",
+        pk_col="id",
         version_col="updated_at",
-        clickhouse_table="orders",
+        clickhouse_table="operators",
+        split_month_column="created_at",
     ),
     ClickHouseTableConfig(
-        table_name="product_reviews",
-        pk_col="review_id",
-        version_col="created_at",
-        clickhouse_table="product_reviews",
+        table_name="stations",
+        pk_col="id",
+        version_col="updated_at",
+        clickhouse_table="stations",
+        split_month_column="created_at",
     ),
     ClickHouseTableConfig(
-        table_name="categories",
-        pk_col="category_id",
-        version_col="created_at",
-        clickhouse_table="categories",
-    ),
-    ClickHouseTableConfig(
-        table_name="products",
-        pk_col="product_id",
-        version_col="created_at",
-        clickhouse_table="products",
-    ),
-    ClickHouseTableConfig(
-        table_name="order_items",
-        pk_col="item_id",
-        version_col=None,
-        clickhouse_table="order_items",
+        table_name="station_traffic",
+        pk_col="id",
+        version_col="updated_at",
+        clickhouse_table="station_traffic",
+        split_month_column="event_time",
     ),
 ]
 
